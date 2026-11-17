@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from typing import Iterable, List, Optional, Sequence, Tuple
 
 from .algorithm import Cycle, detect_cycles
+from .diagnostics import compute_diagnostics
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS cells (
@@ -21,6 +22,13 @@ CREATE TABLE IF NOT EXISTS samples (
     ts           INTEGER NOT NULL,
     current_ma   INTEGER NOT NULL,
     PRIMARY KEY (cell_id, ts)
+);
+
+CREATE TABLE IF NOT EXISTS acq_logs (
+    cell_id      TEXT NOT NULL,
+    seq          INTEGER NOT NULL,
+    ts           INTEGER NOT NULL,
+    PRIMARY KEY (cell_id, seq)
 );
 
 CREATE TABLE IF NOT EXISTS report_versions (
@@ -66,6 +74,19 @@ class ConflictError(Exception):
 
 class ImportError_(Exception):
     """Generic import failure (bad CSV payload etc.)."""
+
+
+class LogConflictError(Exception):
+    """Same (cell, seq) already stored with a different UTC second."""
+
+    def __init__(self, seq: int, existing_ts: int, incoming_ts: int):
+        self.seq = seq
+        self.existing_ts = existing_ts
+        self.incoming_ts = incoming_ts
+        super().__init__(
+            f"log conflict at seq={seq}: existing ts={existing_ts}"
+            f" incoming ts={incoming_ts}"
+        )
 
 
 def _connect(db_path: str) -> sqlite3.Connection:
@@ -142,7 +163,7 @@ class Database:
                     (cell_id, ts),
                 ).fetchone()
                 if row is not None and row["current_ma"] != _to_storage(current):
-                    raise ConflictError(ts, row["current_ma"] / 1000.0, current)
+                    raise ConflictError(ts, row["current_ma"] / 1_000_000.0, current)
 
             inserted = 0
             duplicate = 0
@@ -229,6 +250,109 @@ class Database:
             "total_cycles": len(cycles),
         }
 
+    def import_logs(
+        self, cell_id: str, entries: Iterable[Tuple[int, int]]
+    ) -> dict:
+        """Atomically import a batch of acquisition-log entries (seq, ts).
+
+        Entries may arrive out of order and in any number of batches.
+        Re-uploading an already stored (seq, ts) pair is idempotent; a seq
+        already stored with a *different* timestamp rejects the whole batch
+        (LogConflictError) and nothing is committed.
+        """
+        # Normalize + validate the payload before opening the transaction.
+        incoming: list[tuple[int, int]] = []
+        seen: dict[int, int] = {}
+        try:
+            for seq, ts in entries:
+                seq = int(seq)
+                ts = int(ts)
+                if seq < 0:
+                    raise ValueError(f"negative sequence number {seq}")
+                if ts < 0:
+                    raise ValueError(f"negative timestamp {ts}")
+                if seq in seen and seen[seq] != ts:
+                    raise ImportError_(
+                        f"batch itself contains conflicting timestamps"
+                        f" at seq={seq}"
+                    )
+                seen[seq] = ts
+                incoming.append((seq, ts))
+        except (TypeError, ValueError) as exc:
+            raise ImportError_(f"invalid log entry: {exc}") from exc
+
+        if not incoming:
+            raise ImportError_("batch contains no log entries")
+
+        conn = _connect(self.db_path)
+        try:
+            # One writer at a time, same serialization as sample imports.
+            conn.execute("BEGIN IMMEDIATE")
+
+            # Reject whole batch on any (cell, seq) timestamp mismatch.
+            for seq, ts in incoming:
+                row = conn.execute(
+                    "SELECT ts FROM acq_logs WHERE cell_id=? AND seq=?",
+                    (cell_id, seq),
+                ).fetchone()
+                if row is not None and row["ts"] != ts:
+                    raise LogConflictError(seq, row["ts"], ts)
+
+            inserted = 0
+            duplicate = 0
+            for seq, ts in incoming:
+                cur = conn.execute(
+                    "INSERT OR IGNORE INTO acq_logs(cell_id, seq, ts)"
+                    " VALUES(?,?,?)",
+                    (cell_id, seq, ts),
+                )
+                if cur.rowcount:
+                    inserted += 1
+                else:
+                    duplicate += 1
+
+            conn.execute(
+                "INSERT INTO cells(cell_id) VALUES(?) ON CONFLICT(cell_id)"
+                " DO UPDATE SET updated_at="
+                "strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+                (cell_id,),
+            )
+            total = conn.execute(
+                "SELECT COUNT(*) AS n FROM acq_logs WHERE cell_id=?",
+                (cell_id,),
+            ).fetchone()["n"]
+            conn.execute(
+                "INSERT INTO upload_log(cell_id, status, detail) VALUES(?,?,?)",
+                (
+                    cell_id,
+                    "accepted",
+                    f"acq_logs inserted={inserted} duplicate={duplicate}",
+                ),
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            try:
+                with self._conn() as log_conn:
+                    log_conn.execute(
+                        "INSERT INTO upload_log(cell_id, status, detail)"
+                        " VALUES(?,?,?)",
+                        (cell_id, "rejected",
+                         "acq_logs batch rejected; no data changed"),
+                    )
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
+
+        return {
+            "cell_id": cell_id,
+            "inserted": inserted,
+            "duplicate": duplicate,
+            "total_logs": total,
+        }
+
     # ------------------------------------------------------------------ #
     # Queries
     # ------------------------------------------------------------------ #
@@ -276,6 +400,66 @@ class Database:
                 }
             finally:
                 conn.execute("COMMIT")
+
+    def get_diagnostics(self, cell_id: str) -> Optional[dict]:
+        """Acquisition-log QC diagnostics from one committed snapshot.
+
+        Log rows, raw-sample timestamps and the latest report version with
+        its cycles are all read inside a single transaction, so the
+        findings, the cycle associations and the returned report_version
+        always belong to the same committed state — even when log or
+        sample uploads commit concurrently.
+        """
+        with self._conn() as conn:
+            conn.execute("BEGIN")
+            try:
+                cell = conn.execute(
+                    "SELECT cell_id FROM cells WHERE cell_id=?", (cell_id,)
+                ).fetchone()
+                if cell is None:
+                    return None
+                log_rows = conn.execute(
+                    "SELECT seq, ts FROM acq_logs WHERE cell_id=?"
+                    " ORDER BY seq ASC",
+                    (cell_id,),
+                ).fetchall()
+                sample_rows = conn.execute(
+                    "SELECT ts FROM samples WHERE cell_id=?", (cell_id,)
+                ).fetchall()
+                ver = conn.execute(
+                    "SELECT version, total_cycles FROM report_versions"
+                    " WHERE cell_id=? ORDER BY version DESC LIMIT 1",
+                    (cell_id,),
+                ).fetchone()
+                version = 0
+                total_cycles = 0
+                cycle_rows = []
+                if ver is not None:
+                    version = ver["version"]
+                    total_cycles = ver["total_cycles"]
+                    cycle_rows = conn.execute(
+                        "SELECT cycle_no, started_at, ended_at FROM cycles"
+                        " WHERE cell_id=? AND version=? ORDER BY cycle_no ASC",
+                        (cell_id, version),
+                    ).fetchall()
+            finally:
+                conn.execute("COMMIT")
+
+        diag = compute_diagnostics(
+            [(r["seq"], r["ts"]) for r in log_rows],
+            {r["ts"] for r in sample_rows},
+            [(c["cycle_no"], c["started_at"], c["ended_at"]) for c in cycle_rows],
+        )
+        diag.update(
+            {
+                "cell_id": cell_id,
+                "report_version": version,
+                "total_cycles": total_cycles,
+                "log_count": len(log_rows),
+                "sample_count": len(sample_rows),
+            }
+        )
+        return diag
 
     def list_cells(self) -> List[dict]:
         with self._conn() as conn:
